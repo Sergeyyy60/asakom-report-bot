@@ -397,6 +397,7 @@ async def reg_fio(message: Message, state: FSMContext, bot: Bot):
     await apply_commands(bot, message.from_user.id)
     await state.clear()
     status = user_status(message.from_user.id)
+
     if status == "approved":
         await message.answer(f"Записал: {fio}\nИзменить можно командой /name")
         await show_menu(message)
