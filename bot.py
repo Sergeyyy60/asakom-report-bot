@@ -33,7 +33,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 # Telegram ID главных администраторов через запятую.
 # Если пусто — главным станет тот, кто первым нажмёт /start.
 ADMIN_IDS = {
-    int(x) for x in os.getenv("ADMIN_IDS", "603391958").replace(" ", "").split(",") if x
+    int(x) for x in os.getenv("ADMIN_IDS", "603191958").replace(" ", "").split(",") if x
 }
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 # Часы, которые показываются кнопками при выборе времени
