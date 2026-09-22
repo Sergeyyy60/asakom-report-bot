@@ -393,13 +393,22 @@ async def reg_fio(message: Message, state: FSMContext, bot: Bot):
             f"{fio}, вы первый в этом боте, поэтому назначены главным администратором.\n"
             "Управление объектами, отчётами и доступами — команда /admin"
         )
+    linked = link_offline_worker(fio, message.from_user.id)
+    if linked:
+        fio = linked          # оставляем написание, которое завёл начальник
     save_fio(message.from_user.id, fio)
     await apply_commands(bot, message.from_user.id)
     await state.clear()
     status = user_status(message.from_user.id)
 
     if status == "approved":
-        await message.answer(f"Записал: {fio}\nИзменить можно командой /name")
+        if linked:
+            await message.answer(
+                f"Записал: {fio}\n\nВы уже были заведены руководителем, "
+                "поэтому доступ открыт сразу, а прежние записи привязаны к вам."
+            )
+        else:
+            await message.answer(f"Записал: {fio}\nИзменить можно командой /name")
         await show_menu(message)
         return
     if status == "rejected":
@@ -1278,20 +1287,24 @@ async def a_people(cb: CallbackQuery):
         return
     with db() as c:
         rows = c.execute(
-            """SELECT u.fio, u.status, IFNULL(SUM(r.hours),0) h, COUNT(r.id) n
+            """SELECT u.user_id, u.fio, u.status, IFNULL(SUM(r.hours),0) h, COUNT(r.id) n
                FROM users u LEFT JOIN reports r ON r.user_id = u.user_id
                GROUP BY u.user_id ORDER BY u.fio"""
         ).fetchall()
     if not rows:
-        await cb.message.edit_text("Пока никто не зарегистрировался.", reply_markup=admin_kb())
+        await cb.message.edit_text(
+            "Список монтажников пуст.\n\n"
+            "Можно завести их самому — бот попросит ФИО.",
+            reply_markup=workers_kb())
         await cb.answer()
         return
     marks = {"approved": "", "pending": " ⏳ ждёт подтверждения", "rejected": " ⛔️ отклонён"}
     text = "👥 Монтажники:\n\n" + "\n".join(
         f"• {r['fio']} — записей {r['n']}, часов {r['h']:g}{marks.get(r['status'], '')}"
+        + (" 📵 без Telegram" if r["user_id"] < 0 else "")
         for r in rows
     )
-    await cb.message.edit_text(text, reply_markup=admin_kb())
+    await cb.message.edit_text(text, reply_markup=workers_kb())
     await cb.answer()
 
 
@@ -1785,6 +1798,117 @@ async def disk_now(message: Message):
     await message.answer(
         f"Файл на Яндекс.Диске обновлён:\n{YADISK_FOLDER}/{YADISK_FILE}"
     )
+
+
+# ---------- Начальник заводит монтажников вручную ----------
+# Такой монтажник числится в списках и отчётах ещё до того, как сам открыл бот.
+# За ним можно вести записи; когда он зарегистрируется с тем же ФИО,
+# всё ранее внесённое автоматически привяжется к его аккаунту.
+class NewWorker(StatesGroup):
+    fio = State()
+
+
+def next_offline_id():
+    """Временный номер для монтажника без Telegram (у настоящих ID всегда положительные)."""
+    with db() as c:
+        row = c.execute("SELECT MIN(user_id) m FROM users").fetchone()
+    least = row["m"] if row and row["m"] is not None else 0
+    return min(least, 0) - 1
+
+
+def add_offline_workers(text):
+    """Заводит монтажников по списку ФИО: каждая строка — отдельный человек."""
+    added, dupes = [], []
+    with db() as c:
+        existing = {r["fio"].lower(): r["fio"]
+                    for r in c.execute("SELECT fio FROM users")}
+    for line in (text or "").splitlines():
+        fio = " ".join(line.split())
+        if len(fio) < 5 or len(fio.split()) < 2:
+            continue
+        if fio.lower() in existing:
+            dupes.append(fio)
+            continue
+        with db() as c:
+            c.execute(
+                "INSERT INTO users (user_id, fio, status, created_at) VALUES (?,?,?,?)",
+                (next_offline_id(), fio, "approved",
+                 datetime.now().strftime("%Y-%m-%d %H:%M")),
+            )
+        existing[fio.lower()] = fio
+        added.append(fio)
+    return added, dupes
+
+
+def link_offline_worker(fio, user_id):
+    """Связывает заведённую вручную карточку с настоящим аккаунтом по совпадению ФИО."""
+    with db() as c:
+        # сравниваем на стороне Python: SQLite не умеет приводить кириллицу к нижнему регистру
+        rows = c.execute("SELECT user_id, fio FROM users WHERE user_id < 0").fetchall()
+        match = next((r for r in rows if r["fio"].casefold() == fio.casefold()), None)
+        if not match:
+            return None
+        old, canon = match["user_id"], match["fio"]
+        c.execute("UPDATE reports SET user_id=? WHERE user_id=?", (user_id, old))
+        c.execute("UPDATE expenses SET user_id=? WHERE user_id=?", (user_id, old))
+        c.execute("DELETE FROM users WHERE user_id=?", (old,))
+        c.execute(
+            "INSERT OR REPLACE INTO users (user_id, fio, status, created_at) VALUES (?,?,?,?)",
+            (user_id, canon, "approved", datetime.now().strftime("%Y-%m-%d %H:%M")),
+        )
+    # возвращаем написание ФИО, как его завёл начальник
+    return canon
+
+
+def workers_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить монтажника", callback_data="a:addworker")
+    kb.button(text="⬅️ Назад", callback_data="a:back")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+@router.callback_query(F.data == "a:addworker")
+async def a_add_worker(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer()
+        return
+    await state.set_state(NewWorker.fio)
+    await cb.message.edit_text(
+        "Напишите ФИО монтажника.\n"
+        "Можно сразу несколько — каждый с новой строки:\n\n"
+        "Иванов Иван Иванович\nПетров Сергей Николаевич\n\n"
+        "Он сразу появится в списках и в отчётах. Когда сам откроет бот "
+        "и впишет то же ФИО, доступ включится без заявки, а записи привяжутся к нему."
+    )
+    await cb.answer()
+
+
+@router.message(NewWorker.fio, F.text)
+async def a_add_worker_save(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    added, dupes = add_offline_workers(message.text)
+    await state.clear()
+    if not added and not dupes:
+        await message.answer("Не понял ФИО. Напишите полностью: Иванов Иван Иванович")
+        return
+    parts = []
+    if added:
+        parts.append("Добавлены:\n" + "\n".join(f"• {n}" for n in added))
+    if dupes:
+        parts.append("Уже есть в списке:\n" + "\n".join(f"• {n}" for n in dupes))
+    await message.answer("\n\n".join(parts))
+    await back_to_admin(message)
+    who = get_fio(message.from_user.id) or message.from_user.full_name
+    for admin in admin_ids():
+        if admin != message.from_user.id and added:
+            try:
+                await bot.send_message(
+                    admin, f"👷 {who} добавил монтажников:\n" + "\n".join(f"• {n}" for n in added))
+            except Exception:
+                pass
 
 
 # ---------- Запуск ----------
