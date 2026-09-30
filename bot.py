@@ -285,11 +285,17 @@ def minutes(t):
 
 
 def time_kb(prefix, after=None):
+    """Часы для выбора. Если задано начало — 14 часов подряд от него,
+    с переходом через полночь: 21:00, 22:00, 23:00, 00:00, 01:00…"""
     kb = InlineKeyboardBuilder()
-    for h in HOUR_BUTTONS:
+    if after is None:
+        hours = list(HOUR_BUTTONS)
+    else:
+        start = minutes(after) // 60
+        hours = [(start + 1 + i) % 24 for i in range(14)]
+    for h in hours:
         t = f"{h:02d}:00"
-        if after is None or minutes(t) > minutes(after):
-            kb.button(text=t, callback_data=f"{prefix}:{t}")
+        kb.button(text=t, callback_data=f"{prefix}:{t}")
     kb.adjust(4)
     return kb.as_markup()
 
@@ -327,7 +333,9 @@ def work_summary(d):
     return (
         f"🏗 Объект: {object_name(d['obj'])}\n"
         f"📅 Дата: {fmt_date(d['work_date'])}\n"
-        f"🕐 Время: {d['time_from']}–{d['time_to']} ({d['hours']:g} ч)\n"
+        f"🕐 Время: {d['time_from']}–{d['time_to']}"
+        + (" (следующий день)" if d.get("night") else "")
+        + f" ({d['hours']:g} ч)\n"
         f"💰 Расходы: {d['expenses']:g}"
         + (f" — {d['exp_note']}" if d.get("exp_note") and d["exp_note"] != "—" else "")
         + f"\n📝 Описание и с кем работал: {d['description']}"
@@ -645,15 +653,20 @@ async def tf_text(message: Message, state: FSMContext):
 async def ask_work_expenses(target: Message, state: FSMContext, t):
     data = await state.get_data()
     diff = minutes(t) - minutes(data["time_from"])
-    if diff <= 0:
-        await target.answer("Время окончания должно быть позже начала. Введите ещё раз:")
+    if diff == 0:
+        await target.answer("Начало и окончание совпадают. Введите время окончания ещё раз:")
         return
-    await state.update_data(time_to=t, hours=round(diff / 60, 2))
+    night = diff < 0
+    if night:
+        diff += 24 * 60      # смена закончилась после полуночи, уже на следующий день
+    await state.update_data(time_to=t, hours=round(diff / 60, 2), night=night)
     await state.set_state(Form.expenses)
     kb = InlineKeyboardBuilder()
     kb.button(text="Без расходов", callback_data="exp0")
     await target.answer(
-        f"Время: {data['time_from']}–{t} ({diff / 60:g} ч)\n\n"
+        f"Время: {data['time_from']}–{t}"
+        + (" (следующий день)" if night else "")
+        + f" ({diff / 60:g} ч)\n\n"
         "Сумма расходов за этот день? Напишите число, например 1500",
         reply_markup=kb.as_markup(),
     )
@@ -954,8 +967,11 @@ async def record_card(cb: CallbackQuery):
         await cb.answer("Запись не найдена", show_alert=True)
         return
     if kind == "w":
+        crossed = minutes(r["time_to"]) <= minutes(r["time_from"])
         text = (f"📋 Отчёт о работе\n\n🏗 {r['obj']}\n📅 {fmt_date(r['work_date'])}\n"
-                f"🕐 {r['time_from']}–{r['time_to']} ({r['hours']:g} ч)\n"
+                f"🕐 {r['time_from']}–{r['time_to']}"
+                + (" (следующий день)" if crossed else "")
+                + f" ({r['hours']:g} ч)\n"
                 f"💰 Расходы: {r['expenses']:g}"
                 + (f" — {r['exp_note']}" if r["exp_note"] and r["exp_note"] != "—" else "")
                 + f"\n📝 {r['description']}")
@@ -1688,7 +1704,9 @@ def build_workbook(works, exps):
         wb, "Работы",
         ["Дата", "Объект", "Монтажник", "С", "По", "Часов", "Расходы", "На что расход",
          "Описание и с кем работал", "Внесено", "Внёс за него"],
-        [[fmt_date(r["work_date"]), r["obj_name"], r["user_name"], r["time_from"], r["time_to"],
+        [[fmt_date(r["work_date"]), r["obj_name"], r["user_name"], r["time_from"],
+          # смену, ушедшую за полночь, помечаем прямо во времени окончания
+          r["time_to"] + (" (+1 д.)" if minutes(r["time_to"]) <= minutes(r["time_from"]) else ""),
           r["hours"], r["expenses"], r["exp_note"] or "", r["description"], r["created_at"],
           r["entered_by"] or ""] for r in works],
         ["ИТОГО", "", "", "", "", sum(r["hours"] for r in works),
