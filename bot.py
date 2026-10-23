@@ -24,7 +24,8 @@ from aiogram.types import (BotCommand, BotCommandScopeChat, BufferedInputFile,
                            CallbackQuery, Message)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from openpyxl import Workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 # ================== НАСТРОЙКИ ==================
 # Бот @Asakom_report_bot. Токен задаётся переменной окружения BOT_TOKEN
@@ -86,8 +87,12 @@ def init_db():
             """CREATE TABLE IF NOT EXISTS objects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
+                client_amount REAL,
                 active INTEGER NOT NULL DEFAULT 1)"""
         )
+        # сумма «в клиента» появилась позже — дописываем колонку в старую базу
+        if "client_amount" not in [r[1] for r in c.execute("PRAGMA table_info(objects)")]:
+            c.execute("ALTER TABLE objects ADD COLUMN client_amount REAL")
         c.execute(
             """CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
@@ -1044,6 +1049,7 @@ async def record_fix(cb: CallbackQuery, state: FSMContext, bot: Bot):
 class Adm(StatesGroup):
     add_obj = State()
     rename = State()
+    client_sum = State()        # сумма «в клиента» по объекту
 
 
 def admin_kb():
@@ -1084,8 +1090,9 @@ async def back_to_admin(target: Message):
 
 
 def save_objects(text):
-    """Добавляет объекты: каждая строка — отдельный объект. Возвращает (добавленные, дубли)."""
-    added, dupes = [], []
+    """Добавляет объекты: каждая строка — отдельный объект.
+    Возвращает (добавленные, дубли, id добавленных)."""
+    added, dupes, ids = [], [], []
     existing = {o["name"].lower() for o in active_objects()}
     for line in (text or "").splitlines():
         name = " ".join(line.split())
@@ -1095,10 +1102,63 @@ def save_objects(text):
             dupes.append(name)
             continue
         with db() as c:
-            c.execute("INSERT INTO objects (name) VALUES (?)", (name,))
+            cur = c.execute("INSERT INTO objects (name) VALUES (?)", (name,))
+            ids.append(cur.lastrowid)
         existing.add(name.lower())
         added.append(name)
-    return added, dupes
+    return added, dupes, ids
+
+
+def set_client_amount(obj_id, amount):
+    with db() as c:
+        c.execute("UPDATE objects SET client_amount=? WHERE id=?", (amount, obj_id))
+
+
+def get_client_amount(obj_id):
+    with db() as c:
+        row = c.execute("SELECT client_amount FROM objects WHERE id=?", (obj_id,)).fetchone()
+        return row["client_amount"] if row else None
+
+
+def client_sum_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Пропустить", callback_data="a:nosum")
+    return kb.as_markup()
+
+
+async def ask_client_sum(target: Message, state: FSMContext, obj_id, name):
+    """Спрашивает сумму «в клиента» — её можно не указывать."""
+    await state.set_state(Adm.client_sum)
+    await state.update_data(obj_id=obj_id)
+    await target.answer(
+        f"Объект добавлен: {name}\n\n"
+        "Сколько в клиента по этому объекту? Напишите сумму, например 200000.\n"
+        "Если пока неизвестно — нажмите «Пропустить».",
+        reply_markup=client_sum_kb(),
+    )
+
+
+@router.callback_query(Adm.client_sum, F.data == "a:nosum")
+async def a_client_skip(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_reply_markup()
+    await cb.message.answer("Сумму не записал — её можно указать позже в карточке объекта.")
+    await back_to_admin(cb.message)
+    await cb.answer()
+
+
+@router.message(Adm.client_sum, F.text)
+async def a_client_save(message: Message, state: FSMContext):
+    amount = parse_amount(message.text)
+    if amount is None:
+        await message.answer("Введите сумму числом, например 200000, или нажмите «Пропустить».",
+                             reply_markup=client_sum_kb())
+        return
+    data = await state.get_data()
+    set_client_amount(data["obj_id"], amount)
+    await state.clear()
+    await message.answer(f"Записал: в клиента {amount:g} ₽ по объекту «{object_name(data['obj_id'])}»")
+    await back_to_admin(message)
 
 
 @router.message(Command("add"))
@@ -1114,7 +1174,10 @@ async def add_object(message: Message, state: FSMContext):
             "ЖК Солнечный, кв. 12\nОфис на Ленина, 40\nСклад Северный"
         )
         return
-    added, dupes = save_objects(name)
+    added, dupes, ids = save_objects(name)
+    if len(ids) == 1:
+        await ask_client_sum(message, state, ids[0], added[0])
+        return
     await message.answer(report_added(added, dupes))
 
 
@@ -1143,9 +1206,12 @@ async def a_new(cb: CallbackQuery, state: FSMContext):
 
 @router.message(Adm.add_obj, F.text)
 async def a_new_save(message: Message, state: FSMContext):
-    added, dupes = save_objects(message.text)
+    added, dupes, ids = save_objects(message.text)
     await state.clear()
     await message.answer(report_added(added, dupes))
+    if len(ids) == 1:                      # один объект — сразу спрашиваем сумму
+        await ask_client_sum(message, state, ids[0], added[0])
+        return
     await back_to_admin(message)
 
 
@@ -1207,16 +1273,38 @@ async def a_obj(cb: CallbackQuery):
         e = c.execute(
             "SELECT IFNULL(SUM(amount),0) m FROM expenses WHERE object_id=?", (obj_id,)).fetchone()
     kb = InlineKeyboardBuilder()
+    kb.button(text="💵 Сумма в клиента", callback_data=f"a:sum:{obj_id}")
     kb.button(text="✏️ Переименовать", callback_data=f"a:ren:{obj_id}")
     kb.button(text="📦 В архив", callback_data=f"a:arc:{obj_id}")
     kb.button(text="⬅️ К списку", callback_data="a:list")
     kb.adjust(1)
+    amount = get_client_amount(obj_id)
     await cb.message.edit_text(
         f"🏗 {object_name(obj_id)}\n\n"
-        f"Записей о работе: {w['n']}\n"
+        + (f"💵 В клиента: {amount:g} ₽\n" if amount else "💵 В клиента: не указано\n")
+        + f"Записей о работе: {w['n']}\n"
         f"Всего часов: {w['h']:g}\n"
         f"Всего расходов: {w['m'] + e['m']:g}",
         reply_markup=kb.as_markup(),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("a:sum:"))
+async def a_client_sum_edit(cb: CallbackQuery, state: FSMContext):
+    """Проставить или изменить сумму «в клиента» у уже заведённого объекта."""
+    if not is_admin(cb.from_user.id):
+        await cb.answer()
+        return
+    obj_id = int(cb.data.split(":")[2])
+    amount = get_client_amount(obj_id)
+    await state.set_state(Adm.client_sum)
+    await state.update_data(obj_id=obj_id)
+    await cb.message.edit_text(
+        f"🏗 {object_name(obj_id)}\n\n"
+        + (f"Сейчас: {amount:g} ₽\n\n" if amount else "Сумма пока не указана.\n\n")
+        + "Напишите сумму в клиента, например 200000.",
+        reply_markup=client_sum_kb(),
     )
     await cb.answer()
 
@@ -1731,10 +1819,164 @@ def build_workbook(works, exps):
         ["ИТОГО", "", "", sum(e["amount"] for e in exps)],
         (12, 26, 24, 11, 45, 17, 22),
     )
+    add_projects_sheet(wb, works, exps)
 
     buf = io.BytesIO()
     wb.save(buf)
     return buf
+
+
+# ---------- Лист «Проекты» ----------
+MONEY_FMT = '#,##0.00\\ "₽"'
+# оформление — как в табличке, которую ведёт руководитель.
+# Цвета заданы кодом, а не темой книги: тема у разных Excel своя,
+# и строка объекта получалась почти белой.
+PROJECT_FILL = PatternFill('solid', fgColor='FFDCE6F1')   # строка объекта, «Заголовок 3»
+PROJECT_FONT = '1F497D'                                 # тёмно-синий текст того же стиля
+PERSON_FILL = PatternFill('solid', fgColor='FFF2DCDB')    # строка монтажника, «20% — акцент2»
+THIN_B = Side(style='thin')
+MEDIUM_B = Side(style='medium', color='FF95B3D7')  # «акцент1, светлее 40%»
+
+
+def add_projects_sheet(wb, works, exps):
+    """Лист по проектам: даты в колонках, под каждым объектом его монтажники.
+
+    Бот заполняет часы и расходы, строки «оплата» и сумма «в клиента»
+    остаются под ручной ввод (суммы считаются формулами).
+    """
+    projects = {}
+    for r in works:
+        obj = r["obj_name"] or "—"
+        p = projects.setdefault(obj, {"dates": set(), "people": {}, "last": ""})
+        p["dates"].add(r["work_date"])
+        p["last"] = max(p["last"], r["work_date"])
+        person = p["people"].setdefault(r["user_name"], {"days": {}, "expenses": 0.0})
+        person["days"][r["work_date"]] = person["days"].get(r["work_date"], 0) + (r["hours"] or 0)
+        person["expenses"] += r["expenses"] or 0
+    for e in exps:
+        obj = e["obj_name"] or "—"
+        p = projects.setdefault(obj, {"dates": set(), "people": {}, "last": ""})
+        p["last"] = max(p["last"], e["exp_date"])
+        person = p["people"].setdefault(e["user_name"], {"days": {}, "expenses": 0.0})
+        person["expenses"] += e["amount"] or 0
+    if not projects:
+        return
+
+    # сумма «в клиента» берётся из карточки объекта
+    with db() as c:
+        client = {r["name"]: r["client_amount"]
+                  for r in c.execute("SELECT name, client_amount FROM objects")}
+
+    max_dates = max(len(p["dates"]) for p in projects.values()) or 1
+    date_first, date_last = 3, 2 + max_dates
+    exp_col, cost_col, profit_col = date_last + 1, date_last + 2, date_last + 3
+    first_d, last_d = get_column_letter(date_first), get_column_letter(date_last)
+    exp_l, cost_l = get_column_letter(exp_col), get_column_letter(cost_col)
+
+    ws = wb.create_sheet("Проекты")
+
+    def put(row, col, value, *, bold=False, fmt=None, fill=None, align=None,
+            bottom=None, top=None, color=None, grid=False):
+        c = ws.cell(row=row, column=col, value=value)
+        c.font = Font(bold=bold, size=11, name="Calibri", color=color)
+        if fmt:
+            c.number_format = fmt
+        if fill:
+            c.fill = fill
+        if align:
+            c.alignment = Alignment(horizontal=align)
+        # grid — тонкая линия справа: ими разделяются колонки часов
+        if bottom or top or grid:
+            c.border = Border(bottom=bottom, top=top,
+                              right=THIN_B if grid else None)
+
+    def fill_row(row, fill, cols, *, bold=False, bottom=None, top=None, color=None):
+        """Докрашивает пустые ячейки строки, чтобы блок читался целиком."""
+        for col in cols:
+            c = ws.cell(row=row, column=col)
+            if c.value is None:
+                c.fill = fill
+                c.font = Font(bold=bold, size=11, name="Calibri", color=color)
+                if bottom or top:
+                    # линии между колонками часов, если они есть, сохраняем
+                    c.border = Border(bottom=bottom, top=top, right=c.border.right)
+
+    # шапка
+    put(1, 1, "В клиента")
+    put(1, 2, "Проект и монтажники", bold=True)
+    put(1, date_first, "Даты работ →", bold=True)
+    put(1, exp_col, "Расходы", bold=True, align="center")
+    put(1, cost_col, "Себес", bold=True, align="center")
+    put(1, profit_col, "Доход", bold=True)
+    # пустые ячейки шапки — в том же стиле, что и заголовки
+    for col in range(date_first + 1, exp_col):
+        put(1, col, None, bold=True)
+
+    row = 3
+    # свежие проекты сверху — по последней дате работ
+    for obj in sorted(projects, key=lambda o: projects[o]["last"], reverse=True):
+        p = projects[obj]
+        dates = sorted(p["dates"])
+        head = row
+        put(row, 1, client.get(obj), bold=True, fill=PROJECT_FILL, align="center",
+            bottom=MEDIUM_B, color=PROJECT_FONT)
+        put(row, 2, obj, bold=True, fill=PROJECT_FILL, bottom=MEDIUM_B, color=PROJECT_FONT)
+        for i, d in enumerate(dates):
+            put(row, date_first + i, fmt_date(d), bold=True, fill=PROJECT_FILL,
+                align="center", bottom=MEDIUM_B, color=PROJECT_FONT)
+        # строка объекта закрашена целиком, от «в клиента» до «дохода»
+        fill_row(row, PROJECT_FILL, range(1, profit_col + 1), bold=True,
+                 bottom=MEDIUM_B, color=PROJECT_FONT)
+        ws.row_dimensions[row].height = 15
+        row += 1
+
+        cost_cells = []
+        for n, fio in enumerate(sorted(p["people"])):
+            person = p["people"][fio]
+            # верхняя линия отделяет первого монтажника от строки объекта
+            top = MEDIUM_B if n == 0 else None
+            put(row, 2, fio, fill=PERSON_FILL, top=top)
+            for i, d in enumerate(dates):
+                put(row, date_first + i, person["days"].get(d) or None,
+                    fill=PERSON_FILL, align="center", top=top, grid=True)
+            put(row, exp_col, person["expenses"] or None, fmt=MONEY_FMT,
+                fill=PERSON_FILL, align="center", top=top)
+            # себестоимость монтажника: его оплата за смены плюс его расходы
+            put(row, cost_col, f"=SUM({first_d}{row + 1}:{last_d}{row + 1},{exp_l}{row})",
+                fmt=MONEY_FMT, fill=PERSON_FILL, align="center", top=top)
+            # у монтажника закрашены только его колонки: от названия до себестоимости
+            fill_row(row, PERSON_FILL, range(2, cost_col + 1), top=top)
+            cost_cells.append(f"{cost_l}{row}")
+            row += 1
+            # строка оплаты — её заполняет руководитель
+            put(row, 2, "оплата")
+            for i in range(len(dates)):
+                put(row, date_first + i, None, fmt=MONEY_FMT, align="center",
+                    grid=True)
+            row += 1
+
+        put(head, exp_col, None, fmt=MONEY_FMT, bold=True, fill=PROJECT_FILL,
+            align="center", bottom=MEDIUM_B, color=PROJECT_FONT)
+        put(head, cost_col, "=" + "+".join(cost_cells), fmt=MONEY_FMT, bold=True,
+            fill=PROJECT_FILL, align="right", bottom=MEDIUM_B, color=PROJECT_FONT)
+        put(head, profit_col, f"=A{head}-{cost_l}{head}", fmt=MONEY_FMT, bold=True,
+            fill=PROJECT_FILL, align="right", bottom=MEDIUM_B, color=PROJECT_FONT)
+        row += 2
+
+    # всё, кроме названий, выровнено по центру — как в исходной табличке
+    for r in ws.iter_rows(min_row=2, max_row=row, max_col=profit_col):
+        for c in r:
+            if c.column != 2 and c.alignment.horizontal is None:
+                c.alignment = Alignment(horizontal="center")
+
+    ws.column_dimensions["A"].width = 9.44
+    ws.column_dimensions["B"].width = 34
+    for i in range(date_first, exp_col):
+        ws.column_dimensions[get_column_letter(i)].width = 12
+    ws.column_dimensions[exp_l].width = 16
+    ws.column_dimensions[get_column_letter(profit_col)].width = 11.89
+    ws.freeze_panes = "C3"
+    return ws
 
 
 # ---------- Яндекс.Диск ----------
