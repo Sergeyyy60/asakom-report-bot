@@ -16,12 +16,13 @@ import sqlite3
 from datetime import date, datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart, ExceptionMessageFilter, ExceptionTypeFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (BotCommand, BotCommandScopeChat, BufferedInputFile,
-                           CallbackQuery, Message)
+                           CallbackQuery, ErrorEvent, Message)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -769,6 +770,8 @@ async def work_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
              d["time_to"], d["hours"], d["expenses"], d.get("exp_note", "—"),
              d["description"], entered_by, datetime.now().strftime("%Y-%m-%d %H:%M")),
         )
+    if d.get("replace"):
+        await drop_record(*d["replace"])
     mark_changed()
     await state.clear()
     note = f"\n\nЗапись внесена за {fio}." if entered_by else ""
@@ -881,6 +884,8 @@ async def exp_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
              "", d["comment"], None, entered_by,
              datetime.now().strftime("%Y-%m-%d %H:%M")),
         )
+    if d.get("replace"):
+        await drop_record(*d["replace"])
     mark_changed()
     await state.clear()
     note = f"\n\nЗапись внесена за {fio}." if entered_by else ""
@@ -1027,20 +1032,21 @@ async def record_fix(cb: CallbackQuery, state: FSMContext, bot: Bot):
     if not r or (r["user_id"] != cb.from_user.id and not is_admin(cb.from_user.id)):
         await cb.answer("Запись не найдена", show_alert=True)
         return
-    await drop_record(kind, int(rec_id))
     await state.clear()
+    # старую запись удаляем только когда новая сохранена — при отмене ничего не пропадёт
+    await state.update_data(replace=[kind, int(rec_id)])
     # если начальник правит чужую запись — новая сохранится на того же человека
     if r["user_id"] != cb.from_user.id:
         await state.update_data(for_user=r["user_id"], for_fio=r["user_name"])
     if kind == "w":
         await state.set_state(Form.obj)
         await cb.message.edit_text(
-            "Старая запись удалена, вносим заново.\n\nВыберите объект:",
+            "Вносим запись заново — после сохранения она заменит старую.\n\nВыберите объект:",
             reply_markup=objects_kb("obj"))
     else:
         await state.set_state(Exp.obj)
         await cb.message.edit_text(
-            "Старый расход удалён, вносим заново.\n\nВыберите объект:",
+            "Вносим расход заново — после сохранения он заменит старый.\n\nВыберите объект:",
             reply_markup=objects_kb("eobj"))
     await cb.answer()
 
@@ -2169,6 +2175,39 @@ async def a_add_worker_save(message: Message, state: FSMContext, bot: Bot):
                     admin, f"👷 {who} добавил монтажников:\n" + "\n".join(f"• {n}" for n in added))
             except Exception:
                 pass
+
+
+# ---------- Команда посреди ввода ----------
+@router.message.outer_middleware()
+async def commands_break_input(handler, event: Message, data):
+    """Если посреди заполнения отчёта набрали команду (/admin, /report…),
+    бросаем незаконченный ввод — иначе команда записалась бы как описание или дата."""
+    if event.text and event.text.startswith("/"):
+        state = data.get("state")
+        if state is not None:
+            await state.clear()
+    return await handler(event, data)
+
+
+# ---------- Устаревшие кнопки ----------
+# Ловит нажатия, которые никто не обработал: например, кнопку из старого сообщения
+# или после перезапуска бота, когда незаконченный ввод сбросился.
+@router.callback_query()
+async def stale_button(cb: CallbackQuery):
+    await cb.answer("Эта кнопка устарела. Начните заново: /start", show_alert=True)
+
+
+# ---------- Повторное нажатие той же кнопки ----------
+@router.error(ExceptionTypeFilter(TelegramBadRequest),
+              ExceptionMessageFilter(r".*message is not modified"))
+async def ignore_not_modified(event: ErrorEvent):
+    """Текст не изменился — Telegram ругается, но это не ошибка. Просто снимаем «часики»."""
+    cb = event.update.callback_query
+    if cb:
+        try:
+            await cb.answer()
+        except Exception:
+            pass
 
 
 # ---------- Запуск ----------
